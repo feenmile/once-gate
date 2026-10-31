@@ -6,7 +6,8 @@ Every message passes through unchanged, except `tools/call` requests for a gated
 - repeat (same tool + same arguments, or same `idempotency_key` argument): the stored reply is returned and the
   server is NOT called;
 - started but never finished (crash, timeout, server error): the proxy answers with an error saying the action is
-  INDETERMINATE and does not call the server. A human checks and runs `oncegate release KEY`.
+  INDETERMINATE and does not call the server. A human checks and runs `oncegate release KEY --outcome ...
+  --evidence ...` (or a reconciler configured on the Gate answers from the receiver's own records).
 
 Tools listed in `require_approval` also need a human approval for the EXACT call (tool + canonical arguments),
 created only with `oncegate approve`. Without one the proxy answers APPROVAL_REQUIRED and does not forward.

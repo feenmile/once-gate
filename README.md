@@ -21,10 +21,17 @@ For each gated tool call:
 | First time this action is seen | Claims it, forwards it, stores the result |
 | Same action again (same tool + same arguments, or same `idempotency_key`) | Returns the stored result. **The server is not called.** |
 | Same action arrives while the first is still running | Waits and gives it the first call's answer |
-| Action started but never finished (crash, timeout, server error) | Refuses with **INDETERMINATE**. The action may or may not have happened, so a human checks and then runs `oncegate release KEY` |
+| Action started but never finished (crash, timeout, server error) | Refuses with **INDETERMINATE**. The action may or may not have happened, so a human checks and then releases it **with evidence** (`oncegate release KEY --outcome ... --evidence ...`) |
 
 The last row is the point. Most retry logic assumes a failed call didn't happen. For side effects, that's how you
 charge someone twice. once-gate never re-runs an unfinished action on its own.
+
+## New in 0.2.1
+
+- **Releasing a stuck action requires evidence.** `oncegate release` now needs `--outcome did-not-happen|happened`
+  and `--evidence`, keeps the history instead of deleting it, and writes a receipt. See
+  [below](#releasing-a-stuck-action-requires-evidence).
+- **Optional reconciler** for library use: ask the receiver's own records before refusing an INDETERMINATE call.
 
 ## New in 0.2.0
 
@@ -113,15 +120,80 @@ receipt = gate.run("charge_card", lambda: stripe_charge(order), {"order": order.
 `run` raises `ApprovalRequired`, `Stopped` or `Indeterminate` without calling the function. Approvals for library
 use are created with the same `oncegate approve` command against the same database.
 
+## Releasing a stuck action requires evidence
+
+An INDETERMINATE action may or may not have happened. Releasing it without checking would just be a retry dressed
+up as an audit control, so a release has to say what really happened and how you know. (This was prompted by
+feedback that release without evidence is just a retry.)
+
+```bash
+# you checked, and it did NOT happen: it may run once more
+python -m oncegate release --db claims.db --ledger actions.jsonl "charge_card:order-17" \
+    --outcome did-not-happen --by alex \
+    --evidence "Stripe dashboard: no charge for order 17 between 10:02 and 10:20"
+
+# you checked, and it DID happen: retries replay, nothing runs again
+python -m oncegate release --db claims.db --ledger actions.jsonl "charge_card:order-17" \
+    --outcome happened --evidence "Stripe dashboard: charge ch_3Pq for order 17 at 10:03"
+
+python -m oncegate list --db claims.db --releases     # the release history
+```
+
+- Without `--outcome` and `--evidence` (at least 15 characters, describing what you checked) the command refuses
+  and changes nothing. The same check guards `Gate.release()` and `Store.release()` in the library.
+- `did-not-happen` frees the key so the action can run **once** more. The old claim is not deleted: it moves to the
+  release history with its prior state and error, the outcome, the evidence, who (`--by`) and when.
+- `happened` makes the key `DONE` with a stored result such as
+  `{"reconciled": true, "outcome": "happened", "evidence": "...", "by": ..., "at": ..., "content": [...]}`, so a
+  retry gets that result back and nothing runs again.
+- `DONE` keys are never released, by either outcome.
+- Every release writes a ledger receipt (`event: "released"`, `reason` = the outcome, plus `evidence` and `by`).
+  Pass the proxy's `--ledger` to `release` so the receipt lands in the same log; the release history in the
+  database is kept either way.
+
+Evidence is text a person types. once-gate records it; it cannot verify it. What it guarantees is that nobody
+releases a stuck action without stating, on the record, what they checked.
+
+### Optional reconciler (library)
+
+If the receiver can tell you whether an action happened, for example a payment provider's lookup by idempotency
+key, give the gate a reconciler:
+
+```python
+def reconcile(tool, arguments, key):
+    # Answer ONLY from the receiver's own records. Never guess, and never "try it and see".
+    charge = provider.find_charge(idempotency_key=key)   # your receiver's lookup
+    if charge is None:
+        return "did-not-happen"
+    return "happened" if charge.status == "succeeded" else "unknown"
+
+gate = Gate("claims.db", "actions.jsonl", reconciler=reconcile)
+```
+
+When a call hits an INDETERMINATE key, the gate asks the reconciler:
+
+| Reconciler answers | What once-gate does |
+|---|---|
+| `"happened"` | Records the key `DONE` with evidence `reconciler: happened` and replays it. Nothing runs. |
+| `"did-not-happen"` | Releases the key with evidence `reconciler: did-not-happen` (history kept) and runs the call once, through the normal approval and STOP checks. |
+| `"unknown"`, anything else, or an exception | Stays INDETERMINATE and refuses. Nothing runs. |
+
+Each answer writes a ledger receipt with `event: "reconciled"`. A reconciler must only answer from the receiver's
+own records: if it says `did-not-happen` when it does not know, it has turned the gate back into a retry loop.
+Keys whose last change is younger than `reconcile_min_age` (default 30 seconds) are not reconciled, so a call
+still in flight from another process is not mistaken for one that never arrived. A reconciler's release only takes
+the exact claim it looked at, so two processes reconciling the same key cannot both free it.
+
 ## Receipts (the ledger)
 
 `--ledger` is an append-only JSONL file. Every record has:
 
 | Field | Meaning |
 |---|---|
-| `event` | `claimed`, `done`, `failed`, `replayed`, `refused_indeterminate`, `approval_required`, `stopped`, `relayed_approval_ignored` |
-| `decision` | `allowed`, `replayed` or `refused`; `null` on outcome records (`done`, `failed`) and informational ones |
-| `reason` | for example `first_run`, `approved`, `already_done`, `joined_inflight`, `indeterminate`, `approval_required`, `stop_file_present`, `stop_check_error: ...` |
+| `event` | `claimed`, `done`, `failed`, `replayed`, `refused_indeterminate`, `approval_required`, `stopped`, `relayed_approval_ignored`, `released`, `reconciled` |
+| `decision` | `allowed`, `replayed` or `refused`; `null` on outcome records (`done`, `failed`) and informational ones. For `released`/`reconciled`: `allowed` (did-not-happen: may run once more), `replayed` (happened) or `refused` (reconciler did not know) |
+| `reason` | for example `first_run`, `approved`, `already_done`, `joined_inflight`, `indeterminate`, `approval_required`, `stop_file_present`, `stop_check_error: ...`; for `released`/`reconciled` the outcome (`did-not-happen`, `happened`, `unknown`) |
+| `evidence`, `by` | on `released` and `reconciled` records only: what was checked, and who |
 | `action_hash` | the exact-content hash described above |
 | `tool` | tool name |
 | `at` | RFC 3339 UTC timestamp |
@@ -141,10 +213,13 @@ issuer fields. The ledger is a plain local log, not an ACTA receipt.
 ```bash
 python -m oncegate list --db claims.db                 # every claim and its state
 python -m oncegate list --db claims.db --pending       # calls blocked waiting for approval
-python -m oncegate release --db claims.db "charge_card:order-17"   # after checking by hand that it did NOT happen
+python -m oncegate list --db claims.db --releases      # release history: outcome, evidence, by, when
+python -m oncegate release --db claims.db "charge_card:order-17" --outcome did-not-happen \
+    --evidence "Stripe dashboard: no charge for order 17 between 10:02 and 10:20"
 ```
 
-`DONE` actions can never be released.
+`DONE` actions can never be released. See
+[Releasing a stuck action requires evidence](#releasing-a-stuck-action-requires-evidence).
 
 ## Guarantees and limits
 
@@ -162,7 +237,7 @@ python -m oncegate release --db claims.db "charge_card:order-17"   # after check
 - **STOP is checked per gated call**, before forwarding. It does not interrupt a call already running and does not
   apply to ungated tools.
 
-Version 0.2.0. Built by Feenmile.
+Version 0.2.1. Built by Feenmile.
 
 ## License
 

@@ -4,8 +4,9 @@
                  [--require-approval send_email] [--stop-file STOP] -- <mcp server command...>
   oncegate approve --db claims.db --tool send_email --args-json '{"to": "a@example.com"}' [--ttl-hours 24]
   oncegate approve --db claims.db --pending [--hash HASH]
-  oncegate list --db claims.db [--approvals | --pending]
-  oncegate release --db claims.db KEY
+  oncegate list --db claims.db [--approvals | --pending | --releases]
+  oncegate release --db claims.db KEY --outcome did-not-happen|happened --evidence "what you checked"
+                   [--by NAME] [--ledger log.jsonl]
 
 Approvals are created ONLY here, by a person at a terminal. On an interactive terminal the person must type the
 first 8 characters of the action hash. Without a terminal, approval is refused unless --i-am-a-human is given.
@@ -20,7 +21,8 @@ import os
 import sys
 import time
 
-from .gate import Gate, action_hash, canonical_json, find_relayed_approvals
+from .gate import (MIN_EVIDENCE_CHARS, OUTCOMES, EvidenceRequired, Gate, action_hash, canonical_json,
+                   find_relayed_approvals)
 from .proxy import Proxy
 
 CONFIRM_CHARS = 8
@@ -131,6 +133,36 @@ def _approve(gate: Gate, a) -> int:
     return _grant(gate, p["tool"], args, a.ttl_hours, a.i_am_a_human)
 
 
+RELEASE_HELP = f"""not released: say what really happened, and how you know.
+  --outcome did-not-happen   you checked and the action did NOT happen; it may run once more
+  --outcome happened         you checked and it DID happen; retries will replay, nothing runs again
+  --evidence "..."           what you checked, at least {MIN_EVIDENCE_CHARS} characters, for example
+                             "Stripe dashboard: no charge for order 17 between 10:02 and 10:20"
+Releasing without evidence would just be a retry."""
+
+
+def _release(a) -> int:
+    if not a.outcome or a.evidence is None:
+        print(RELEASE_HELP, file=sys.stderr)
+        return 2
+    gate = Gate(a.db, a.ledger)
+    try:
+        rel = gate.release(a.key, a.outcome, a.evidence, a.by)
+    except EvidenceRequired as exc:
+        print(f"not released: {exc}", file=sys.stderr)
+        print(RELEASE_HELP, file=sys.stderr)
+        return 2
+    if rel is None:
+        print("not released (unknown key, or already DONE: DONE actions are never released)", file=sys.stderr)
+        return 1
+    if a.outcome == "happened":
+        print(f"recorded as happened: {a.key} is DONE; a retry replays and nothing runs again (release {rel['id']})")
+    else:
+        print(f"released: {a.key} may run once more; the old claim is kept in the release history (release "
+              f"{rel['id']})")
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     server_cmd = []
@@ -159,8 +191,14 @@ def main(argv=None) -> int:
     ls.add_argument("--db", required=True)
     ls.add_argument("--approvals", action="store_true", help="show approvals instead")
     ls.add_argument("--pending", action="store_true", help="show calls blocked for approval instead")
-    rl = sub.add_parser("release", help="forget a CLAIMED/FAILED key after checking by hand")
+    ls.add_argument("--releases", action="store_true", help="show the release history instead")
+    rl = sub.add_parser("release", help="resolve a CLAIMED/FAILED key, with the outcome and evidence you checked")
     rl.add_argument("--db", required=True)
+    rl.add_argument("--outcome", choices=OUTCOMES,
+                    help="did-not-happen: the action may run again; happened: retries replay, nothing re-runs")
+    rl.add_argument("--evidence", help=f"what you checked, at least {MIN_EVIDENCE_CHARS} characters")
+    rl.add_argument("--by", help="who checked")
+    rl.add_argument("--ledger", help="append the release receipt to this ledger (use the proxy's ledger)")
     rl.add_argument("key")
     a = p.parse_args(argv)
 
@@ -172,6 +210,8 @@ def main(argv=None) -> int:
             p.error("give the MCP server command after --")
         gate = Gate(a.db, a.ledger, require_approval=csv(a.require_approval), stop_file=a.stop_file)
         return Proxy(server_cmd, gate, csv(a.tools), a.key_arg).run()
+    if a.cmd == "release":
+        return _release(a)
     gate = Gate(a.db)
     if a.cmd == "approve":
         return _approve(gate, a)
@@ -180,15 +220,13 @@ def main(argv=None) -> int:
             rows = gate.store.approvals()
         elif a.pending:
             rows = gate.store.pending()
+        elif a.releases:
+            rows = gate.store.releases()
         else:
             rows = [{k: r[k] for k in ("key", "tool", "state", "error")} for r in gate.store.all()]
         for row in rows:
             print(json.dumps(row, ensure_ascii=False))
         return 0
-    if a.cmd == "release":
-        ok = gate.store.release(a.key)
-        print("released" if ok else "not released (unknown key, or already DONE)")
-        return 0 if ok else 1
     return 2
 
 

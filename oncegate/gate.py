@@ -2,7 +2,8 @@
 
 Order of checks for one call (see Gate.admit):
   1. claim table: already DONE -> replay the stored result (nothing runs, no approval needed);
-     CLAIMED/FAILED -> refuse as INDETERMINATE;
+     CLAIMED/FAILED -> refuse as INDETERMINATE, unless a configured reconciler answers from the receiver's own
+     records: "happened" -> record DONE and replay, "did-not-happen" -> release (history kept) and go on to run once;
   2. approval (only for tools in require_approval): an unused, unexpired human approval for the EXACT action hash;
   3. claim the key, spend the approval;
   4. STOP file, checked last, immediately before the caller forwards/runs the action. If it trips, the claim and
@@ -17,19 +18,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .store import CLAIMED, DONE, FAILED, Store
+from .store import (CLAIMED, DID_NOT_HAPPEN, DONE, FAILED, HAPPENED, MIN_EVIDENCE_CHARS, OUTCOMES,
+                    EvidenceRequired, Store, check_release)
 
 # Any argument (or envelope field) whose name contains this is treated as an attempt to carry an approval in-band.
 RELAY_MARKER = "approv"
+UNKNOWN = "unknown"
 
 
 class Indeterminate(Exception):
     """The action was started before and never finished cleanly. It may or may not have happened. A human must
-    check the real world and then `oncegate release KEY` (or leave it)."""
+    check the real world and then `oncegate release KEY --outcome ... --evidence ...` (or leave it)."""
 
     def __init__(self, key: str, row: dict):
-        super().__init__(f"INDETERMINATE: {key} is {row['state']} since {row['claimed_at']:.0f}; check by hand, "
-                         f"then release it if the action did not happen")
+        super().__init__(f"INDETERMINATE: {key} is {row['state']} since {row['claimed_at']:.0f}; check the real "
+                         f"world, then `oncegate release` it with --outcome did-not-happen|happened and --evidence")
         self.key, self.row = key, row
 
 
@@ -97,8 +100,9 @@ class Ledger:
     """Append-only JSONL record of every gate decision, including refusals.
 
     Every record carries: event, decision ("allowed" | "replayed" | "refused", or null for outcome/informational
-    records), reason, action_hash, tool, at (RFC 3339 UTC). tool_name and issued_at repeat tool and at under the
-    names used by the ACTA signed-receipts Internet-Draft; see README for what is and is not aligned."""
+    records), reason, action_hash, tool, at (RFC 3339 UTC). Release and reconcile records ("released",
+    "reconciled") also carry evidence and by; their reason is the outcome. tool_name and issued_at repeat tool and
+    at under the names used by the ACTA signed-receipts Internet-Draft; see README for what is and is not aligned."""
 
     def __init__(self, path: str | Path | None):
         self.path = Path(path) if path else None
@@ -116,12 +120,21 @@ class Ledger:
 
 
 class Gate:
+    """reconciler (optional): callable(tool, arguments, key) -> "happened" | "did-not-happen" | "unknown", asked
+    when a call hits an INDETERMINATE key. It must answer ONLY from the receiver's own records (for example a payment
+    provider's lookup by idempotency key), never by guessing or by trying the action. Anything other than those two
+    answers, or an exception, keeps the key INDETERMINATE and the call refused. Keys whose last change is younger
+    than reconcile_min_age seconds are not reconciled, so a call still in flight elsewhere is not mistaken for one
+    that never arrived."""
+
     def __init__(self, db: str | Path, ledger: str | Path | None = None, require_approval=None,
-                 stop_file: str | Path | None = None):
+                 stop_file: str | Path | None = None, reconciler=None, reconcile_min_age: float = 30.0):
         self.store = Store(db)
         self.ledger = Ledger(ledger)
         self.require_approval = set(require_approval or ())
         self.stop_file = str(stop_file) if stop_file else None
+        self.reconciler = reconciler
+        self.reconcile_min_age = float(reconcile_min_age)
 
     def needs_approval(self, tool: str) -> bool:
         return tool in self.require_approval
@@ -145,7 +158,7 @@ class Gate:
     def decide(self, key: str, tool: str, h: str | None = None):
         """Claim-table decision only (no approval, no STOP). Returns ("run", None) or ("replay", result); raises
         Indeterminate. Kept for 0.1 callers; new code should use admit()."""
-        won, row = self.store.claim(key, tool)
+        won, row = self.store.claim(key, tool, h)
         if won:
             self.ledger.write("claimed", "allowed", "first_run", h, tool, key=key)
             return "run", None
@@ -157,6 +170,49 @@ class Gate:
             return "replay", row["result"]
         self.ledger.write("refused_indeterminate", "refused", "indeterminate", h, tool, key=key, state=row["state"])
         raise Indeterminate(key, row)
+
+    # --- resolving INDETERMINATE keys: only with an outcome and evidence ---
+
+    def _resolve(self, event: str, key: str, outcome: str, evidence: str, by: str | None,
+                 expect_claimed_at: float | None = None, h: str | None = None) -> dict | None:
+        rel = self.store.release(key, outcome, evidence, by, expect_claimed_at)  # raises EvidenceRequired
+        if rel is not None:
+            self.ledger.write(event, "allowed" if outcome == DID_NOT_HAPPEN else "replayed", outcome,
+                              rel["action_hash"] or h, rel["tool"], key=key, evidence=rel["evidence"], by=by,
+                              release_id=rel["id"], prior_state=rel["prior_state"])
+        return rel
+
+    def release(self, key: str, outcome: str, evidence: str, by: str | None = None) -> dict | None:
+        """A person checked the real world for an INDETERMINATE (CLAIMED/FAILED) key and says what they found.
+
+        "did-not-happen": the key is freed so the action may run again; the old claim is kept in the release
+        history. "happened": the key becomes DONE, so a retry replays instead of running again.
+        Raises EvidenceRequired (nothing changes) without an outcome and at least MIN_EVIDENCE_CHARS characters of
+        evidence. Returns the release record, or None if the key is unknown or DONE (DONE is never released)."""
+        return self._resolve("released", key, outcome, evidence, by)
+
+    def _reconcile(self, key: str, tool: str, arguments: dict, h: str, row: dict) -> dict | None:
+        """Ask the reconciler about an INDETERMINATE row. Returns the row to act on: a DONE row to replay, the
+        unchanged row (still INDETERMINATE) to refuse, or None when the key was released and may now be claimed."""
+        if self.reconciler is None or row["state"] not in (CLAIMED, FAILED):
+            return row
+        if time.time() - row["updated_at"] < self.reconcile_min_age:
+            return row  # may still be in flight elsewhere: do not ask yet
+        try:
+            answer = self.reconciler(tool, arguments, key)
+            detail = None
+        except Exception as exc:  # a reconciler that cannot answer has not answered
+            answer, detail = UNKNOWN, f"{type(exc).__name__}: {exc}"[:300]
+        if not (isinstance(answer, str) and answer in OUTCOMES):
+            extra = {"evidence": f"reconciler: {UNKNOWN}", "by": "reconciler"}
+            if detail:
+                extra["error"] = detail
+            elif answer != UNKNOWN:
+                extra["answer"] = repr(answer)[:100]
+            self.ledger.write("reconciled", "refused", UNKNOWN, h, tool, key=key, **extra)
+            return row  # RECONCILER GUARD: anything but a definite answer stays INDETERMINATE
+        self._resolve("reconciled", key, answer, f"reconciler: {answer}", "reconciler", row["claimed_at"], h)
+        return self.store.get(key)
 
     def admit(self, tool: str, arguments: dict | None = None, key: str | None = None, envelope: dict | None = None):
         """Decide one call. Returns ("replay", result, None) or ("run", None, ticket). On "run" the caller must
@@ -173,6 +229,8 @@ class Gate:
 
         row = self.store.get(k)
         if row is not None:
+            row = self._reconcile(k, tool, arguments, h, row)
+        if row is not None:
             action, result = self._existing(k, tool, h, row)
             return action, result, None
 
@@ -184,7 +242,7 @@ class Gate:
                 self.ledger.write("approval_required", "refused", "approval_required", h, tool, key=k)
                 raise ApprovalRequired(tool, arguments, h)
 
-        won, row = self.store.claim(k, tool)
+        won, row = self.store.claim(k, tool, h)
         if not won:
             action, result = self._existing(k, tool, h, row)
             return action, result, None
@@ -229,5 +287,6 @@ class Gate:
         return result
 
 
-__all__ = ["Gate", "Indeterminate", "ApprovalRequired", "Stopped", "key_for", "action_hash", "canonical_json",
-           "summarize", "find_relayed_approvals", "CLAIMED", "DONE", "FAILED"]
+__all__ = ["Gate", "Indeterminate", "ApprovalRequired", "Stopped", "EvidenceRequired", "key_for", "action_hash",
+           "canonical_json", "summarize", "find_relayed_approvals", "CLAIMED", "DONE", "FAILED", "HAPPENED",
+           "DID_NOT_HAPPEN", "OUTCOMES", "MIN_EVIDENCE_CHARS", "UNKNOWN", "check_release"]

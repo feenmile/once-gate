@@ -64,13 +64,15 @@ class LibraryGate(unittest.TestCase):
         self.gate.store.claim(k, "charge")  # simulate a crash: claimed, never finished
         with self.assertRaises(Indeterminate):
             self.gate.run("charge", self.act, {"amount": 5})
-        self.assertTrue(self.gate.store.release(k))
+        self.assertTrue(self.gate.release(k, "did-not-happen", "payment log: no charge for this amount"))
         self.gate.run("charge", self.act, {"amount": 5})
         self.assertEqual(self.calls, 1)
 
     def test_done_keys_cannot_be_released(self):
         self.gate.run("charge", self.act, {"amount": 5})
-        self.assertFalse(self.gate.store.release(key_for("charge", {"amount": 5})))
+        for outcome in ("did-not-happen", "happened"):
+            self.assertIsNone(self.gate.release(key_for("charge", {"amount": 5}), outcome,
+                                                "payment log: charge is there, all fine"))
 
     def test_ledger_records_every_decision(self):
         self.gate.run("x", self.act, {})

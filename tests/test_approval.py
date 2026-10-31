@@ -95,7 +95,8 @@ class ApprovalGuards(Base):
         self.proxy([call(1, "boom", EMAIL)], require="boom")
         self.assertEqual(self.runs("boom"), 1)
         from oncegate import key_for
-        self.assertTrue(Store(self.db).release(key_for("boom", EMAIL)))
+        self.assertTrue(Store(self.db).release(key_for("boom", EMAIL), "did-not-happen",
+                                               "mail server log: nothing sent to someone@example.com"))
         r = self.proxy([call(2, "boom", EMAIL)], require="boom")
         self.assertEqual(self.runs("boom"), 1)
         self.assertEqual(r[2]["error"]["data"]["code"], "APPROVAL_REQUIRED")
