@@ -23,7 +23,25 @@ CREATE TABLE IF NOT EXISTS claims (
     error TEXT,
     claimed_at REAL NOT NULL,
     updated_at REAL NOT NULL
-)
+);
+CREATE TABLE IF NOT EXISTS approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_hash TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    used_at REAL
+);
+CREATE INDEX IF NOT EXISTS approvals_hash ON approvals (action_hash);
+CREATE TABLE IF NOT EXISTS pending (
+    action_hash TEXT PRIMARY KEY,
+    tool TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    attempts INTEGER NOT NULL
+);
 """
 
 
@@ -33,7 +51,7 @@ class Store:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=30)
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute(SCHEMA)
+        self._db.executescript(SCHEMA)
 
     def claim(self, key: str, tool: str) -> tuple[bool, dict | None]:
         """Try to claim key. Returns (won, existing_row). Exactly one caller can win a key, across threads and
@@ -73,6 +91,59 @@ class Store:
         with self._lock:
             cur = self._db.execute("DELETE FROM claims WHERE key=? AND state IN (?,?)", (key, CLAIMED, FAILED))
             return cur.rowcount == 1
+
+    def unclaim(self, key: str) -> bool:
+        """Drop a CLAIMED key that the caller KNOWS was never forwarded (for example a last-second STOP)."""
+        with self._lock:
+            cur = self._db.execute("DELETE FROM claims WHERE key=? AND state=?", (key, CLAIMED))
+            return cur.rowcount == 1
+
+    # --- approvals: written only by the human CLI, consumed (single use) by the gate ---
+
+    def add_approval(self, action_hash: str, tool: str, args_json: str, expires_at: float) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._db.execute("INSERT INTO approvals (action_hash, tool, args_json, created_at, expires_at) "
+                                   "VALUES (?,?,?,?,?)", (action_hash, tool, args_json, now, expires_at))
+            self._db.execute("DELETE FROM pending WHERE action_hash=?", (action_hash,))
+            return cur.lastrowid
+
+    def find_approval(self, action_hash: str, now: float | None = None) -> int | None:
+        """Id of an unused, unexpired approval for exactly this action hash, or None. Does not consume it."""
+        now = time.time() if now is None else now
+        row = self._db.execute("SELECT id FROM approvals WHERE action_hash=? AND used_at IS NULL AND expires_at > ? "
+                               "ORDER BY created_at LIMIT 1", (action_hash, now)).fetchone()
+        return row[0] if row else None
+
+    def consume_approval(self, approval_id: int, action_hash: str, now: float | None = None) -> bool:
+        """Mark one approval used. A single UPDATE guarded on used_at IS NULL, so two callers cannot both use it."""
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._db.execute("UPDATE approvals SET used_at=? WHERE id=? AND action_hash=? AND used_at IS NULL "
+                                   "AND expires_at > ?", (now, approval_id, action_hash, now))
+            return cur.rowcount == 1
+
+    def unconsume_approval(self, approval_id: int) -> None:
+        """Give an approval back when the action it was spent on was provably never forwarded."""
+        with self._lock:
+            self._db.execute("UPDATE approvals SET used_at=NULL WHERE id=?", (approval_id,))
+
+    def approvals(self) -> list[dict]:
+        cols = ("id", "action_hash", "tool", "args_json", "created_at", "expires_at", "used_at")
+        rows = self._db.execute(f"SELECT {', '.join(cols)} FROM approvals ORDER BY id").fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+    def note_pending(self, action_hash: str, tool: str, args_json: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._db.execute("INSERT INTO pending (action_hash, tool, args_json, first_seen, last_seen, attempts) "
+                             "VALUES (?,?,?,?,?,1) ON CONFLICT(action_hash) DO UPDATE SET last_seen=excluded.last_seen,"
+                             " attempts=attempts+1", (action_hash, tool, args_json, now, now))
+
+    def pending(self) -> list[dict]:
+        cols = ("action_hash", "tool", "args_json", "first_seen", "last_seen", "attempts")
+        rows = self._db.execute(f"SELECT {', '.join(cols)} FROM pending ORDER BY first_seen").fetchall()
+        return [dict(zip(cols, r)) for r in rows]
 
     def all(self) -> list[dict]:
         keys = [r[0] for r in self._db.execute("SELECT key FROM claims ORDER BY claimed_at").fetchall()]

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "once-gate"
-version = "0.1.0"
-description = "Make AI agent side effects happen at most once: an MCP proxy and library with a claim table."
+version = "0.2.0"
+description = "Make AI agent side effects happen at most once, with exact-content human approval and a STOP file: an MCP proxy and library."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Feenmile" }]
-keywords = ["mcp", "ai-agents", "idempotency", "exactly-once", "safety"]
+keywords = ["mcp", "ai-agents", "idempotency", "exactly-once", "safety", "human-in-the-loop", "approval"]
 classifiers = ["License :: OSI Approved :: MIT License", "Programming Language :: Python :: 3"]
 
 [project.scripts]
