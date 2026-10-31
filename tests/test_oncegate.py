@@ -1,8 +1,11 @@
 import json
 import multiprocessing
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -143,6 +146,85 @@ class ProxyEndToEnd(unittest.TestCase):
         _, counts, _ = self.run_proxy([self.call(1, "pay", idempotency_key="inv-9", amount=5),
                                        self.call(2, "pay", idempotency_key="inv-9", amount=5, retry=True)])
         self.assertEqual(counts.get("pay"), 1)
+
+
+class InFlightDuplicate(unittest.TestCase):
+    """A repeat that arrives while the first call is still running waits and gets the first call's answer.
+
+    The fake server holds the "slow" call open until the test creates a release file, so the overlap is forced,
+    not left to timing. A barrier message the proxy answers itself (an unapproved "send") proves the duplicate was
+    fully handled by the proxy before the first call was allowed to finish."""
+
+    def test_duplicate_while_first_is_running_waits_and_gets_the_same_answer(self):
+        tmp = Path(tempfile.mkdtemp())
+        counter = tmp / "count.json"
+        release = Path(str(counter) + ".release")
+        ledger = tmp / "l.jsonl"
+        cmd = [sys.executable, "-m", "oncegate", "proxy", "--db", str(tmp / "c.db"), "--ledger", str(ledger),
+               "--tools", "slow", "--require-approval", "send", "--", sys.executable, FAKE, str(counter)]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                cwd=str(ROOT))
+        replies = queue.Queue()
+
+        def read_replies():
+            for line in proc.stdout:
+                if line.strip():
+                    replies.put(json.loads(line))
+
+        reader = threading.Thread(target=read_replies, daemon=True)
+        reader.start()
+
+        def send(msg):
+            proc.stdin.write((json.dumps(msg) + "\n").encode())
+            proc.stdin.flush()
+
+        def wait_for(pred, what, timeout=30):
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                if pred():
+                    return
+                time.sleep(0.01)
+            self.fail(f"timed out waiting for {what}")
+
+        def slow_runs():
+            try:
+                return json.loads(counter.read_text()).get("slow", 0)
+            except (OSError, ValueError):
+                return 0
+
+        got = {}
+
+        def next_reply(timeout=30):
+            r = replies.get(timeout=timeout)
+            got[r["id"]] = r
+            return r
+
+        try:
+            send(ProxyEndToEnd.call(1, "slow", job="report"))
+            wait_for(lambda: slow_runs() == 1, "the first call to reach the server")
+            send(ProxyEndToEnd.call(2, "slow", job="report"))  # the first call is still blocked in the server
+            send(ProxyEndToEnd.call(3, "send", to="a"))  # barrier: answered by the proxy itself
+            while 3 not in got:
+                next_reply()
+            # The duplicate was handled before the barrier, yet it must still be waiting, not answered.
+            self.assertNotIn(2, got, "the duplicate was answered before the first call finished")
+            self.assertNotIn(1, got)
+            self.assertIn("APPROVAL_REQUIRED", got[3]["error"]["message"])
+            release.write_text("go")
+            while 1 not in got or 2 not in got:
+                next_reply()
+        finally:
+            release.write_text("go")
+            proc.stdin.close()
+            proc.wait(timeout=60)
+            proc.stdout.close()
+            reader.join(timeout=5)
+
+        self.assertEqual(slow_runs(), 1)  # the server ran the action once
+        self.assertIn("result", got[1])
+        self.assertEqual(got[1]["result"], got[2]["result"])
+        reasons = [json.loads(l)["reason"] for l in ledger.read_text(encoding="utf-8").splitlines()]
+        self.assertIn("joined_inflight", reasons)
 
 
 if __name__ == "__main__":
